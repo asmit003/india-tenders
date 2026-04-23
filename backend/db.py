@@ -2,6 +2,9 @@ from sqlalchemy import create_engine, Column, String, Numeric, Date, Time
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import text
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ✅ DATABASE URL
 DATABASE_URL = "postgresql://postgres:asmit.2singh@db.ucxotdzdzhfneiuqzaxg.supabase.co:5432/postgres"
@@ -11,7 +14,10 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # ✅ Engine
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"sslmode": "require"}
+)
 
 # ✅ Session
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

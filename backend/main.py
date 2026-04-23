@@ -19,7 +19,7 @@ class TenderResponse(BaseModel):
     award_date: str
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 
 # -------------------------------
@@ -47,7 +47,7 @@ def health_check():
 # -------------------------------
 # Get Tenders
 # -------------------------------
-@app.get("/api/tenders")
+@app.get("/api/tenders", response_model=list[TenderResponse])
 def get_tenders():
     db = SessionLocal()
     tenders = db.query(Tender).order_by(Tender.award_date.desc()).limit(50).all()
