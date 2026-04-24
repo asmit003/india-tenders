@@ -1,18 +1,41 @@
 import re
+import os
 import asyncio
+import logging
+from datetime import datetime
+from typing import List
+
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
-from datetime import datetime
+from sqlalchemy.exc import SQLAlchemyError
 
-# correct import
 from backend.db import SessionLocal, Tender
 
 
 # -------------------------------
-# Utility Functions
+# CONFIGURATION
 # -------------------------------
+SCRAPER_URL = os.getenv(
+    "SCRAPER_URL",
+    "https://eprocure.gov.in/eprocure/app?page=ResultOfTenders"
+)
 
-def extract_value_in_crores(raw_text):
+MAX_RETRIES = 3
+
+
+# -------------------------------
+# LOGGING SETUP
+# -------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+
+# -------------------------------
+# VALUE EXTRACTION
+# -------------------------------
+def extract_value_in_crores(raw_text: str) -> float:
     try:
         text = raw_text.lower().replace(',', '').strip()
 
@@ -22,29 +45,28 @@ def extract_value_in_crores(raw_text):
 
         value = float(match.group(1))
 
-        # detect unit
         if 'crore' in text or 'cr' in text:
             return value
-
         elif 'lakh' in text or 'lac' in text:
             return value / 100
-
-        else:
-            # if small number → already in crores
-            if value < 1000:
-                return value
-
-            # otherwise assume rupees
+        elif 'rs' in text or '₹' in text:
             return value / 10000000
+        else:
+            if value > 10000000:
+                return value / 10000000
+            return value
 
-    except:
+    except Exception:
         return 0
 
 
-def classify_sector(title):
+# -------------------------------
+# SECTOR CLASSIFICATION
+# -------------------------------
+def classify_sector(title: str) -> str:
     title_lower = title.lower()
 
-    if any(k in title_lower for k in ['highway', 'road', 'bridge', 'railway']):
+    if any(k in title_lower for k in ['road', 'highway', 'bridge', 'rail']):
         return "Infrastructure"
 
     if any(k in title_lower for k in ['power', 'solar', 'energy']):
@@ -57,59 +79,71 @@ def classify_sector(title):
 
 
 # -------------------------------
+# FETCH PAGE WITH RETRY
+# -------------------------------
+async def fetch_page(page, url: str):
+    for attempt in range(MAX_RETRIES):
+        try:
+            await page.goto(url, timeout=60000)
+            await page.wait_for_selector("table", timeout=15000)
+            return await page.content()
+        except Exception as e:
+            logging.warning(f"Retry {attempt+1}/{MAX_RETRIES} failed: {e}")
+            await asyncio.sleep(2)
+
+    raise Exception("Failed to load page after retries")
+
+
+# -------------------------------
 # MAIN SCRAPER
 # -------------------------------
-
 async def scrape_cppp_data():
-    URL = "https://eprocure.gov.in/eprocure/app?page=ResultOfTenders"
-
-    print("🚀 Starting scraper for CPPP...")
+    logging.info("🚀 Starting scraper...")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
 
         try:
-            await page.goto(URL, timeout=60000)
-            await page.wait_for_selector("table", timeout=15000)
-
-            html = await page.content()
+            html = await fetch_page(page, SCRAPER_URL)
             soup = BeautifulSoup(html, "html.parser")
 
             table = soup.find("table")
-
             if not table:
-                print("❌ No table found")
-                await browser.close()
-                return {"status": "error", "message": "No table found"}
+                logging.error("❌ No table found")
+                return {"status": "error"}
 
             rows = table.find_all("tr")[1:]
 
             db = SessionLocal()
+            new_tenders: List[Tender] = []
             tenders_added = 0
 
             for row in rows:
                 cols = row.find_all("td")
 
-                if len(cols) < 7:
+                if len(cols) < 6:
                     continue
 
-                tender_id = cols[0].text.strip()
-                title = cols[2].text.strip()
-                winner = cols[4].text.strip()
-                raw_value = cols[5].text.strip()
-                award_date_str = cols[6].text.strip()
+                # -------------------------------
+                # COLUMN MAPPING
+                # -------------------------------
+                tender_id = cols[1].text.strip()
+                title = " ".join(cols[3].text.split())
+
+                if len(title) < 10:
+                    continue
+
+                raw_value = cols[4].text.strip()
+                award_date_str = cols[5].text.strip()
 
                 value_cr = extract_value_in_crores(raw_value)
-
-                # debug
-                print("VALUE:", value_cr)
-
-                # skip invalid values
-                if value_cr <= 0 or value_cr >= 100000:
+                if value_cr <= 0:
                     continue
 
-                # avoid duplicates
+                # -------------------------------
+                # DUPLICATE CHECK
+                # -------------------------------
                 existing = db.query(Tender).filter(
                     Tender.tender_id == tender_id
                 ).first()
@@ -117,61 +151,71 @@ async def scrape_cppp_data():
                 if existing:
                     continue
 
-                # parse date safely
+                # -------------------------------
+                # DATE PARSING
+                # -------------------------------
                 try:
                     date_obj = datetime.strptime(
                         award_date_str, "%d-%b-%Y %I:%M %p"
                     )
                     award_date = date_obj.date()
                     award_time = date_obj.time()
-                except:
+                except Exception:
                     award_date = datetime.now().date()
                     award_time = datetime.now().time()
 
-                # IMPORTANT: do NOT set id manually
-                new_tender = Tender(
+                # -------------------------------
+                # CREATE OBJECT
+                # -------------------------------
+                tender = Tender(
                     tender_id=tender_id,
                     title=title,
                     sector=classify_sector(title),
-                    winning_company=winner,
+                    winning_company="N/A",
                     value_crore=value_cr,
                     award_date=award_date,
                     award_time=award_time,
                     source_portal="CPPP",
-                    source_url=URL
+                    source_url=SCRAPER_URL
                 )
 
-                db.add(new_tender)
-                tenders_added += 1
+                new_tenders.append(tender)
 
-            db.commit()
+            # -------------------------------
+            # BULK INSERT
+            # -------------------------------
+            if new_tenders:
+                db.bulk_save_objects(new_tenders)
+                db.commit()
+                tenders_added = len(new_tenders)
+
             db.close()
-            await browser.close()
 
-            print(f"✅ Added {tenders_added} tenders")
+            logging.info(f"✅ Added {tenders_added} tenders")
 
             return {
                 "status": "success",
                 "tenders_added": tenders_added
             }
 
+        except SQLAlchemyError as db_error:
+            logging.error(f"DB Error: {db_error}")
+            return {"status": "error", "message": "DB failure"}
+
         except Exception as e:
+            logging.error(f"Scraper Error: {e}")
+            return {"status": "error", "message": str(e)}
+
+        finally:
             await browser.close()
-            print(f"❌ Scraper Error: {e}")
-
-            return {
-                "status": "error",
-                "message": str(e)
-            }
 
 
 # -------------------------------
-# RUN BLOCK
+# RUN (LOCAL TESTING)
 # -------------------------------
-
 async def main():
     result = await scrape_cppp_data()
-    print(result)
+    logging.info(result)
 
 
 if __name__ == "__main__":

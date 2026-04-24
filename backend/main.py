@@ -1,6 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from datetime import date
 
 # ✅ Import scraper + DB
 from backend.scraper import scrape_cppp_data
@@ -16,7 +17,7 @@ class TenderResponse(BaseModel):
     sector: str
     winning_company: str
     value_crore: float
-    award_date: str
+    award_date: date
 
     class Config:
         from_attributes = True
